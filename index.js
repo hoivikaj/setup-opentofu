@@ -6,11 +6,14 @@
 const core = require('@actions/core');
 
 const setup = require('./lib/setup-tofu');
+const { getErrorMessage, getErrorDetail } = require('./lib/error-utils');
 
 (async () => {
   try {
     await setup();
   } catch (error) {
-    core.setFailed(error.message);
+    const message = getErrorMessage(error);
+    core.debug(getErrorDetail(error));
+    core.setFailed(message);
   }
 })();

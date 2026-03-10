@@ -1,6 +1,91 @@
 /******/ (() => { // webpackBootstrap
 /******/ 	var __webpack_modules__ = ({
 
+/***/ 6526:
+/***/ ((module) => {
+
+/**
+ * Copyright (c) OpenTofu
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * Normalizes errors (including AggregateError from fetch/undici) into
+ * a single, actionable message for GitHub Actions logs.
+ */
+
+/**
+ * Get a user-friendly message from any error.
+ * - AggregateError: flattens error.errors so network/download causes are visible.
+ * - Standard Error: returns message; includes cause if present (Node 16+).
+ *
+ * @param {unknown} error - Caught value (Error, AggregateError, or other).
+ * @returns {string} Single-line message suitable for core.setFailed().
+ */
+function getErrorMessage (error) {
+  if (error instanceof AggregateError && Array.isArray(error.errors)) {
+    if (error.errors.length === 0) {
+      return 'AggregateError (one or more operations failed)';
+    }
+    const parts = error.errors.map((e) => (e && typeof e.message === 'string' ? e.message : String(e)));
+    const combined = parts.join('; ');
+    return combined || 'AggregateError (one or more operations failed)';
+  }
+
+  if (error instanceof Error) {
+    if (error.cause instanceof Error) {
+      return `${error.message}: ${error.cause.message}`;
+    }
+    return error.message;
+  }
+
+  return String(error);
+}
+
+/**
+ * Get a detailed string for logging (e.g. core.debug or core.error).
+ * Includes stack and, for AggregateError, each nested error.
+ *
+ * @param {unknown} error - Caught value.
+ * @returns {string} Multi-line detail string.
+ */
+function getErrorDetail (error) {
+  const lines = [];
+
+  if (error instanceof AggregateError && Array.isArray(error.errors)) {
+    lines.push(`AggregateError (${error.errors.length} error(s)):`);
+    error.errors.forEach((e, i) => {
+      lines.push(`  [${i + 1}] ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof Error && e.stack) {
+        lines.push(e.stack.split('\n').map((l) => '    ' + l).join('\n'));
+      }
+    });
+    if (error.stack) {
+      lines.push('Outer stack:');
+      lines.push(error.stack);
+    }
+    return lines.join('\n');
+  }
+
+  if (error instanceof Error) {
+    lines.push(error.message);
+    if (error.stack) lines.push(error.stack);
+    if (error.cause) {
+      lines.push('Caused by:');
+      lines.push(getErrorDetail(error.cause));
+    }
+    return lines.join('\n');
+  }
+
+  return String(error);
+}
+
+module.exports = {
+  getErrorMessage,
+  getErrorDetail
+};
+
+
+/***/ }),
+
 /***/ 8536:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -8,6 +93,8 @@
  * Copyright (c) OpenTofu
  * SPDX-License-Identifier: MPL-2.0
  */
+
+const { getErrorMessage } = __nccwpck_require__(6526);
 
 class Build {
   constructor (version, name) {
@@ -45,14 +132,33 @@ async function fetchReleases (githubToken) {
     Accept: 'application/json'
   };
 
-  const resp = await http.get(url, headers);
+  let resp;
+  try {
+    resp = await http.get(url, headers);
+  } catch (error) {
+    const cause = getErrorMessage(error);
+    throw new Error(`Failed to fetch OpenTofu releases from ${url}: ${cause}`);
+  }
 
   if (resp.message.statusCode !== hc.HttpCodes.OK) {
     throw new Error('failed fetching releases (' + resp.message.statusCode + ')');
   }
 
-  const body = await resp.readBody();
-  const releasesMeta = JSON.parse(body);
+  let body;
+  try {
+    body = await resp.readBody();
+  } catch (error) {
+    const cause = getErrorMessage(error);
+    throw new Error(`Failed to read releases response: ${cause}`);
+  }
+
+  let releasesMeta;
+  try {
+    releasesMeta = JSON.parse(body);
+  } catch (error) {
+    const cause = getErrorMessage(error);
+    throw new Error(`Invalid releases JSON from ${url}: ${cause}`);
+  }
 
   /**
      * @type {Array}
@@ -138,6 +244,7 @@ const core = __nccwpck_require__(7484);
 const tc = __nccwpck_require__(3472);
 const io = __nccwpck_require__(4994);
 const releases = __nccwpck_require__(8536);
+const { getErrorMessage } = __nccwpck_require__(6526);
 
 // arch in [arm, x32, x64...] (https://nodejs.org/api/os.html#os_os_arch)
 // return value in [amd64, 386, arm]
@@ -160,7 +267,13 @@ function mapOS (os) {
 
 async function downloadAndExtractCLI (url) {
   core.debug(`Downloading OpenTofu CLI from ${url}`);
-  const pathToCLIZip = await tc.downloadTool(url);
+  let pathToCLIZip;
+  try {
+    pathToCLIZip = await tc.downloadTool(url);
+  } catch (error) {
+    const cause = getErrorMessage(error);
+    throw new Error(`Failed to download OpenTofu from ${url}: ${cause}`);
+  }
 
   if (!pathToCLIZip) {
     throw new Error(`Unable to download OpenTofu from ${url}`);
@@ -169,14 +282,19 @@ async function downloadAndExtractCLI (url) {
   let pathToCLI;
 
   core.debug('Extracting OpenTofu CLI zip file');
-  if (os.platform().startsWith('win')) {
-    core.debug(`OpenTofu CLI Download Path is ${pathToCLIZip}`);
-    const fixedPathToCLIZip = `${pathToCLIZip}.zip`;
-    await io.mv(pathToCLIZip, fixedPathToCLIZip);
-    core.debug(`Moved download to ${fixedPathToCLIZip}`);
-    pathToCLI = await tc.extractZip(fixedPathToCLIZip);
-  } else {
-    pathToCLI = await tc.extractZip(pathToCLIZip);
+  try {
+    if (os.platform().startsWith('win')) {
+      core.debug(`OpenTofu CLI Download Path is ${pathToCLIZip}`);
+      const fixedPathToCLIZip = `${pathToCLIZip}.zip`;
+      await io.mv(pathToCLIZip, fixedPathToCLIZip);
+      core.debug(`Moved download to ${fixedPathToCLIZip}`);
+      pathToCLI = await tc.extractZip(fixedPathToCLIZip);
+    } else {
+      pathToCLI = await tc.extractZip(pathToCLIZip);
+    }
+  } catch (error) {
+    const cause = getErrorMessage(error);
+    throw new Error(`Failed to extract OpenTofu archive: ${cause}`);
   }
 
   core.debug(`OpenTofu CLI path is ${pathToCLI}.`);
@@ -330,7 +448,7 @@ async function run () {
     }
     return release;
   } catch (error) {
-    core.error(error);
+    core.error(getErrorMessage(error));
     throw error;
   }
 }
@@ -36569,12 +36687,15 @@ var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 
 const setup = __nccwpck_require__(3882);
+const { getErrorMessage, getErrorDetail } = __nccwpck_require__(6526);
 
 (async () => {
   try {
     await setup();
   } catch (error) {
-    core.setFailed(error.message);
+    const message = getErrorMessage(error);
+    core.debug(getErrorDetail(error));
+    core.setFailed(message);
   }
 })();
 
